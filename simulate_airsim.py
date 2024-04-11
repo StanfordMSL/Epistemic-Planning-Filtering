@@ -3,28 +3,26 @@
 """
 simulate_airsim.py
 Author: Keiko Nagami
-
+Date: 02-17-24
+Description:
+   Simulate belief space planning and filtering in Airsim environment
 """
 
 import numpy as np
-import airsim
 import airsimdroneracinglab
 import cv2
 import time
-import utils
-import os
 import copy
 import math
-import argparse
 from scipy.spatial.transform import Rotation as R
 
 import torch 
-from visualizers import trajviz3D, plotmeasurements
-from belief_plan_3D import TrajectoryOptimization
-from estimate_3D import EKF
-from train import NNLearning
-from init_traj import ipopt_traj
-from mpc_track import track_traj
+from tools.visualizers import plottraj, plotmeasurements
+from planning.belief_plan import TrajectoryOptimization
+from filtering.estimate import EKF
+from perception.train import NNLearning
+from planning.init_traj import ipopt_traj
+from planning.mpc_track import track_traj
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches 
 import matplotlib.cm as cm
@@ -35,73 +33,50 @@ class AirsimSim():
         self.airsim_client = airsimdroneracinglab.MultirotorClient()
         self.airsim_client.confirmConnection()
 
-        self.airsim_client_camera = airsim.MultirotorClient()
-        self.airsim_client_camera.confirmConnection()
-
-        self.level_name = 'Soccer_Field_Easy' #'Soccer_Field_Medium'
+        self.level_name = 'Soccer_Field_Easy'
         self.vehicle_name = 'drone_1'
         self.gate_count = 0
-        self.lap_count = 2
+        self.lap_count = 0
         self.mu_y = 10.0
 
-        self.load_level(self.level_name)
+        self.load_level()
         self.airsim_client.race_tier = 1
 
-        self.gate_names = self.get_gate_names()
+        self.gate_names = ['Gate00', 'Gate01', 'Gate02', 'Gate03', 'Gate04', 'Gate05', 'Gate06', 'Gate07', 'Gate08', 'Gate09', 'Gate10_21', 'Gate11_23', 'Gate00']
         self.get_gatenum()
 
         # MPC THINGS
         self.num_steps = 200
         self.traj_length = 200
+        self.x0 = np.array([0.4, 0.4, 0.55, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0])   # initial state
         self.xf = np.array([0.5, 0.2, 0.5, 0.5, 0.5, 0.5, 0., -1.0, 0.])     # goal state
         self.s0 = 0.0001*np.identity(9)     # initial uncertainty
         self.dt = 0.02                      # time step
-        self.case_num = 2                   # case_num = 4 predicted measurement with sigma grad, case_num = 2 max likelihood observation with sigma grad
  
-        # load uncertainty map for visualization
-        self.var_map = np.loadtxt("./images/varmaps/dronegate/large96k_test_x_map_inv.txt")
-
-        # # Planner Sub-class
-        self.trajopt_class = TrajectoryOptimization(self.dt, baseline=False, uncertainty_type="epistemic")
-        self.trajopt_class.case_num = self.case_num
+        # Planner Sub-class
+        self.trajopt_class = TrajectoryOptimization(self.dt, baseline=False, uncertainty_mode="epistemic")
         self.trajopt_class.iterations = 2
 
-        # # Estimator Sub-class
+        # Estimator Sub-class
         self.ekf_class = EKF(self.trajopt_class.n, self.trajopt_class.m, self.trajopt_class.h, self.trajopt_class.dt)
-
-        self.im_count = 0
-        self.empty_image = False
-
-        self.save_interval = 25
         
-    def get_gate_names(self):
-        # define gates
-        if self.level_name == 'Soccer_Field_Easy':
-            gate_names = ['Gate00', 'Gate01', 'Gate02', 'Gate03', 'Gate04', 'Gate05', 'Gate06', 'Gate07', 'Gate08', 'Gate09', 'Gate10_21', 'Gate11_23', 'Gate00']
-        elif self.level_name == 'Soccer_Field_Medium':
-            gate_names = ['Gate00', 'Gate01', 'Gate02', 'Gate03', 'Gate04', 'Gate05', 'Gate06', 'Gate07', 'Gate08', 'Gate09', 'Gate10', 'Gate11', 'Gate12', 'Gate13', 'Gate14', 'Gate15', 'Gate16', 'Gate17', 'Gate18', 'Gate19', 'Gate20', 'Gate21', 'Gate22', 'Gate23', 'Gate24']
-        elif self.level_name == 'ZhangJiaJie_Medium':
-            gate_names = ['Gate00', 'Gate01', 'Gate02', 'Gate03', 'Gate04', 'Gate05', 'Gate06', 'Gate07', 'Gate08', 'Gate09', 'Gate10', 'Gate11', 'Gate12', 'Gate13', 'Gate14', 'Gate15', 'Gate16', 'Gate17', 'Gate18', 'Gate19', 'Gate20', 'Gate21', 'Gate22', 'Gate23', 'Gate24']
-        return gate_names
-
+        self.im_count = 0
+        
     def get_gt_image(self, global_pose):
         self.im_count += 1
-        # MOVE CAMERA
-        self.airsim_client.simSetVehiclePose(global_pose, True)
-        request = [airsim.ImageRequest('fpv_cam', airsim.ImageType.Scene, False, False)]
-        response = self.airsim_client_camera.simGetImages(request, vehicle_name=self.vehicle_name)
 
+        # Move camera
+        self.airsim_client.simSetVehiclePose(global_pose, True)
+
+        # Take
+        request = [airsimdroneracinglab.ImageRequest('fpv_cam', airsimdroneracinglab.ImageType.Scene, False, False)]
+        response = self.airsim_client.simGetImages(request, vehicle_name=self.vehicle_name)
         img_rgb_1d = np.frombuffer(response[0].image_data_uint8, dtype=np.uint8)
         img_rgb = img_rgb_1d.reshape(response[0].height, response[0].width, 3)
 
-        if np.linalg.norm(img_rgb) < 0.1:
-            self.empty_image = True
-            print("Empty Image")
-            # return empty_image
-            img_gray = None
-        else:
-            cv2.imwrite("./images/airsim/frame.jpg", img_rgb) #+ str(self.im_count) + ".jpg", img_rgb)
-            img_gray = cv2.imread("./images/airsim/frame.jpg", cv2.IMREAD_GRAYSCALE) # + str(self.im_count) + ".jpg", cv2.IMREAD_GRAYSCALE)
+        # Store image
+        cv2.imwrite("./images/airsim/frame_" + str(self.im_count) + ".jpg", img_rgb)
+        img_gray = cv2.imread("./images/airsim/frame_" + str(self.im_count) + ".jpg", cv2.IMREAD_GRAYSCALE) 
         return img_gray
 
     def get_gatenum(self):
@@ -147,8 +122,6 @@ class AirsimSim():
             eul_et_global = self.getGateEulerAngles(gate_orientation_global @ self.getRotationMatrix_euler(eul_et_local))
             vel_et_global = gate_orientation_global @ vel_et_local
 
-            # print("pos_gt_global: ", pos_gt_global)
-
             # new gate
             self.gate_pose = self.airsim_client.simGetObjectPose(self.gate_names[self.gate_count])
 
@@ -178,7 +151,6 @@ class AirsimSim():
             self.ekf_class.mu[3:6] = pose_et_local_new[3:6]
             self.ekf_class.mu[6::] = vel_et_local_new
 
-            # check if poor initial estimate causes gate miss
             self.mu_y = pos_et_local_new[1]
                         
         else:
@@ -199,21 +171,6 @@ class AirsimSim():
                                         [2*(q1*q2 + q0*q3), 1-2*(q1**2+q3**2), 2*(q2*q3-q0*q1)],
                                         [2*(q1*q3-q0*q2), 2*(q1*q0+q2*q3), 1-2*(q1**2+q2**2)]])
         return rot_matrix_obj2global
-
-    """
-    def quat2euler(quat):
-        gets euler angles from quaternions
-    """
-    def quat2euler(self, airsim_quat):
-        qw = quat.w_val
-        qx = quat.x_val
-        qy = quat.y_val
-        qz = quat.z_val
-        roll = np.arctan2(2*(qw*qx + qy*qz) , 1-2*(qx**2 + qy**2))
-        pitch = np.arcsin(2*(qw*qy - qz*qx))
-        yaw = np.arctan2(2*(qw*qz + qx*qy) , 1-2*(qy**2 + qz**2))
-        euler_angles = np.array([roll, pitch, yaw])
-        return euler_angles
 
     """
     def getRotationMatrix_euler(euler_angles):
@@ -240,12 +197,8 @@ class AirsimSim():
         return roll, pitch, yaw  # radians
 
     def get_airsim_pose(self, local_pose):
-        # print("get_airsim_pose1: ", self.x)
         # unnormalize
         local_pose = (local_pose * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
-        # print("get_airsim_pose2: ", self.x)
-
-        # print("airsim pose unnormalized: ", local_pose)
         rotation_roll180 = np.array([[1, 0, 0],[0, np.cos(np.pi),-np.sin(np.pi)],[0, np.sin(np.pi), np.cos(np.pi)]])
         
         # GATE DEFS
@@ -274,13 +227,11 @@ class AirsimSim():
         quad_pose_airsim = airsimdroneracinglab.Pose(quad_position_airsim, quad_quat_airsim)
         return quad_pose_airsim
     
-    # loads desired level
-    def load_level(self, level_name, sleep_sec = 2.0):
-        self.level_name = level_name
+    # loads level
+    def load_level(self):
         self.airsim_client.simLoadLevel(self.level_name)
-        self.airsim_client.confirmConnection() # failsafe
-        self.airsim_client_camera.confirmConnection()
-        time.sleep(sleep_sec) # let the environment load completely
+        self.airsim_client.confirmConnection() 
+        time.sleep(2.0)
 
     def quad_dynamics(self, u):
         # clip u
@@ -318,136 +269,66 @@ class AirsimSim():
         th = x[3:6] + self.dt*(body2euler_rate_mtx @ u[1::]) + rand_th
         v  = x[6:9] + self.dt*a + rand_v
         x_new = np.hstack((p,th,v))
-        # self.gt_y = p[1]
 
         # normalize
         x_new[0:6] = (x_new[0:6] - self.trajopt_class.dronegate_minimum.detach().cpu().numpy()) / self.trajopt_class.dronegate_bounds.detach().cpu().numpy()
         return x_new
 
-    def save_point(self,i, gate_count, u_opt, traj_u, traj_gt, traj_est, traj_z, traj_Q, traj_S, traj_R, X_nominal):
-        np.savetxt("./empty_save/u_opt_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", u_opt)
-        np.savetxt("./empty_save/traj_u_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", traj_u)
+    def runAirsimSim(self):
+        self.x  = self.x0.copy()
+        self.ekf_class.mu    = self.x0 + np.random.normal(0.0, 0.001, size=(9,))
+        self.ekf_class.sigma = self.s0
 
-        np.savetxt("./empty_save/x_now_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", self.x)
-        np.savetxt("./empty_save/mu_now_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", self.ekf_class.mu)
-        np.savetxt("./empty_save/s_now_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", self.ekf_class.sigma)
-        
-        np.savetxt("./empty_save/traj_gt_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", traj_gt)
-        np.savetxt("./empty_save/traj_est_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", traj_est)
-        np.savetxt("./empty_save/traj_z_" + str(self.lap_count) + "_"  + str(gate_count) + "_" + str(i) + ".txt", traj_z)
-
-        np.savetxt("./empty_save/traj_Q_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", traj_Q)
-        np.savetxt("./empty_save/traj_S_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", traj_S)
-        np.savetxt("./empty_save/traj_R_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", traj_R)
-
-        np.savetxt("./empty_save/gatect_alpha_imct_pconst_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", np.array([self.gate_count, self.trajopt_class.alpha, self.im_count-1, self.trajopt_class.pconst]))
-        np.savetxt("./empty_save/X_nominal_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".txt", X_nominal)
-        if self.trajopt_class.baseline == False:
-            torch.save(self.trajopt_class.optimizer.state_dict(), "./empty_save/opt_state_dict_" + str(self.lap_count) + "_" + str(gate_count) + "_" + str(i) + ".pth")
-
-
-    def runAirsimSim(self, args):
-        print("restart: ", args.restart)
-        if args.restart == False:
-            self.x0 = np.array([0.4, 0.4, 0.55, 0.5, 0.5, 0.5, 0.0, 0.0, 0.0])
-            self.x  = self.x0.copy()
-            self.ekf_class.mu    = self.x0 + np.random.normal(0.0, 0.001, size=(9,))
-            self.ekf_class.sigma = self.s0
-
-        elif args.restart == True:
-            self.gate_count = args.gate_count
-            self.x0   = np.loadtxt("./empty_save/x_now_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            self.x    = self.x0.copy()
-             
-            self.ekf_class.mu    = np.loadtxt("./empty_save/mu_now_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            self.ekf_class.sigma = np.loadtxt("./empty_save/s_now_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            self.mu_y =  (self.ekf_class.mu[1] * self.trajopt_class.dronegate_bounds[1]) + self.trajopt_class.dronegate_minimum[1]
-            if self.mu_y < 3.0:
-                print("recede goal")
-                self.xf[1] = 0.0
-                recede_count = 1
-            else:
-                recede_count = 0
-            self.u_init = np.loadtxt("./empty_save/u_opt_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            traj_u      = np.loadtxt("./empty_save/traj_u_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            u_opt       = self.u_init.copy()
-            u           = self.u_init.copy()
-
-            traj_est = np.loadtxt("./empty_save/traj_est_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            traj_gt  = np.loadtxt("./empty_save/traj_gt_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            traj_z   = np.loadtxt("./empty_save/traj_z_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-
-            traj_Q = np.loadtxt("./empty_save/traj_Q_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            traj_S  = np.loadtxt("./empty_save/traj_S_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            traj_R   = np.loadtxt("./empty_save/traj_R_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-
-            X_nominal = np.loadtxt("./empty_save/X_nominal_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            traj_length    = self.u_init.shape[1] + 1
-            self.num_steps = self.u_init.shape[1] + 1
-            
-            other_params = np.loadtxt("./empty_save/gatect_alpha_imct_pconst_" + str(self.lap_count) + "_" + str(self.gate_count) + "_" + str(args.iteration) + ".txt")
-            self.get_gatenum()
-
-            self.trajopt_class.alpha = other_params[1]
-            self.im_count = int(other_params[2])
-            self.trajopt_class.pconst = other_params[3]
-            
         while self.gate_count < 13:
-            if args.restart == False:
-                mu_phys = copy.deepcopy(self.ekf_class.mu)
-                mu_phys[0:6] = (self.ekf_class.mu[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
-                self.xf[1] = 0.2
-                xf = copy.deepcopy(self.xf)
-                xf[0:6] = (xf[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
+            # Initialize filter estimate
+            mu_phys = copy.deepcopy(self.ekf_class.mu)
+            mu_phys[0:6] = (self.ekf_class.mu[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
+            self.xf[1] = 0.2
+            xf = copy.deepcopy(self.xf)
+            xf[0:6] = (xf[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
 
-                traj_est = self.ekf_class.mu.reshape((-1, 1))
-                traj_gt  = self.x.reshape((-1, 1))
-                traj_Q = np.diag(self.ekf_class.Q)
-                traj_S = np.diag(self.ekf_class.sigma)
-                if self.gate_count == 0:
-                    traj_length = 100
-                else:
-                    traj_length = 200 # self.traj_length
+            traj_est = self.ekf_class.mu.reshape((-1, 1))
+            traj_gt  = self.x.reshape((-1, 1))
+            traj_Q = np.diag(self.ekf_class.Q)
+            traj_S = np.diag(self.ekf_class.sigma)
+            if self.gate_count == 0:
+                traj_length = 100
+            else:
+                traj_length = 200
 
-                ipopt_u, ipopt_x = ipopt_traj(mu_phys, xf, traj_length, baseline=False)
-                self.u_init = np.zeros((self.trajopt_class.m, traj_length-1))
-                X = np.zeros((self.trajopt_class.n, traj_length))
+            # Initialize trajectory
+            ipopt_u, ipopt_x = ipopt_traj(mu_phys, xf, traj_length)
+            self.u_init = np.zeros((self.trajopt_class.m, traj_length-1))
+            X = np.zeros((self.trajopt_class.n, traj_length))
 
-                self.u_init[:,:] = ipopt_u[:,:] 
-                X[:,:] = ipopt_x[:,:]
-                u_opt = self.u_init.copy()
-                
-                self.trajopt_class.max_iters  = 100
-                self.trajopt_class.pconst = 1.e-5
-                self.trajopt_class.alpha = 2.e-3
-                i = 0
-                recede_count = 0
-                opt_state_dict_fname = "./opt_state_dict.pth"
-
-            elif args.restart == True:
-
-                i = args.iteration + 1
-                opt_state_dict_fname = "./empty_save/opt_state_dict_"  + str(self.gate_count) + "_" + str(args.iteration) + ".pth"
-
-            num_iters = 0
+            self.u_init[:,:] = ipopt_u[:,:] 
+            X[:,:] = ipopt_x[:,:]
+            u_opt = self.u_init.copy()
+            
+            # Initialize counters and constants
+            self.trajopt_class.max_iters  = 100
+            self.trajopt_class.alpha = 2.e-3
+            i = 0
+            recede_count = 0
             final_cost = 10.
             time_array = []
+
             while self.mu_y > 0.5:
-                # compute action from current state
+                # Compute action from current state
                 self.trajopt_class.init_traj(self.ekf_class.mu, self.ekf_class.sigma, self.xf, traj_length)
 
-                opt_state_dict = None
-
                 if (final_cost >= 1000.) or ((i==0) and (self.trajopt_class.baseline==True)):
+                    # Baseline Planner
+                    print("Compute Straight-Line Plan")
                     mu_phys = copy.deepcopy(self.ekf_class.mu)
                     mu_phys[0:6] = (self.ekf_class.mu[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
 
                     xf = copy.deepcopy(self.xf)
                     xf[0:6] = (xf[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
                     if i == 0:
-                        ipopt_u, ipopt_x = ipopt_traj(mu_phys, xf, traj_length, X, u_opt.T.flatten(), baseline=False)
+                        ipopt_u, ipopt_x = ipopt_traj(mu_phys, xf, traj_length, X, u_opt.T.flatten())
                     else:
-                        ipopt_u, ipopt_x = ipopt_traj(mu_phys, xf, traj_length, X[:, 1::], u_opt.T.flatten(), baseline=False)
+                        ipopt_u, ipopt_x = ipopt_traj(mu_phys, xf, traj_length, X[:, 1::], u_opt.T.flatten())
                     u = np.zeros((self.trajopt_class.m, traj_length-1))
                     X = np.zeros((self.trajopt_class.n, traj_length))
 
@@ -460,9 +341,11 @@ class AirsimSim():
                     u = torch.from_numpy(u)
                     final_cost = 10.
                 elif (i == 0) and (self.trajopt_class.baseline == False):
-                    u, X_nominal, S, num_iters, final_cost = self.trajopt_class.solve_opt(i,u_opt,opt_state_dict)
+                    print("Compute Belief Space Plan")
+                    u, X_nominal, S, num_iters, final_cost = self.trajopt_class.solve_opt(u_opt)
                     X = copy.deepcopy(X_nominal)
                 else:
+                    print("Track Trajectory ", i)
                     mu_phys = copy.deepcopy(self.ekf_class.mu)
                     mu_phys[0:6] = (self.ekf_class.mu[0:6] * self.trajopt_class.dronegate_bounds.detach().cpu().numpy()) + self.trajopt_class.dronegate_minimum.detach().cpu().numpy()
                     plan_start_time = time.time()
@@ -493,10 +376,6 @@ class AirsimSim():
                 quad_airsim_pose = self.get_airsim_pose(self.x[0:6])     # convert local pose to airsim pose
                 z_image = self.get_gt_image(quad_airsim_pose)
                 self.airsim_client.simPause(True)
-
-                # if the image is empty
-                if self.empty_image == True:
-                    break
 
                 z_image = cv2.resize(z_image, (64,64))
                 z_image = z_image / 255.0
@@ -529,6 +408,7 @@ class AirsimSim():
                     R = np.diag(Rb.squeeze().detach().cpu().numpy()) 
                     __, __, __ = self.ekf_class.ekf(u[:,0], (z,R), self.trajopt_class.learning_class, GPS)
                 self.mu_y = (self.ekf_class.mu[1]*self.trajopt_class.dronegate_bounds[1]) + self.trajopt_class.dronegate_minimum[1]
+
                 traj_gt = np.column_stack((traj_gt, self.x.reshape((-1,1))))
                 traj_est = np.column_stack((traj_est, self.ekf_class.mu.reshape((-1,1))))
 
@@ -550,30 +430,18 @@ class AirsimSim():
                     u_opt = np.column_stack((u[:,1::], u[:,-1]))  
                     X = np.column_stack((X, X[:,-1]))
                     X_nominal = np.column_stack((X_nominal, X_nominal[:,-1]))
-                args.restart = False
-                opt_state_dict_fname = "./opt_state_dict.pth"
 
                 if self.mu_y < 3.0:
                     self.xf[1] = 0.0
-                    # self.xf[7] = -1.5
                     if recede_count == 0:
                         final_cost = 1001.
                         recede_count = 1
                         print("recede goal")
-                   
                 i += 1
 
-            if self.empty_image == True:
-                break
         self.lap_count += 1
         self.gate_count = 1
      
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='')
-    parser.add_argument('--gate_num', dest = 'gate_count', type = int, default = 2)
-    parser.add_argument('--iteration', dest = 'iteration', type = int, default = 0)
-    parser.add_argument('--restart', dest = 'restart', action=argparse.BooleanOptionalAction, default=False)
-    args = parser.parse_args()
-
     airsimsim_class = AirsimSim()
-    airsimsim_class.runAirsimSim(args)
+    airsimsim_class.runAirsimSim()
